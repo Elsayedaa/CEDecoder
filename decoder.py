@@ -1,11 +1,30 @@
-## Version 2
+## Version 3
 ## Changes:
-# Shuffles were done inplace on the X & Y data structures in version 1,
-# now they are done on deep copies.
+
+# Option to use BayesSearchCV and RandomizedSearchCV hyperparameter optimization
+
+# Added new models: KNN, Gaussian Process, Naive Bayes
+
+# Added Ada boost ensemble
 
 # Made some memory utilization optimizations.
+import copy
+import numpy as np
+import sparse
+from sklearn.preprocessing import scale
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.ensemble import BaggingClassifier
+from sklearn.multiclass import OneVsRestClassifier
+from skopt import BayesSearchCV
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+from sklearn.metrics import confusion_matrix
+
 class decoder:
-    def __init__(self, X, Y):
+    def __init__(self, X, Y, model: str, params = None, boost = False):
         """
         X: Must be a 3D matrix of shape (N(Neurons), N(Trials), N(Timepoints))
         Y: Must be a 1D array of categorical labels corresponding to the stimulus
@@ -14,19 +33,22 @@ class decoder:
         self.X = X
         self.Y = Y
         
-    ## build a custom train/test splitter
-    # gives an equal number of training and test
-    # trial instances for each stimulus
-    
-    def apply_temporal_smoothing(self, trial_data, window, t_axis):
-        return np.apply_along_axis(
-                        lambda m: np.convolve(
-                            m, np.ones(window)/window, 
-                            mode='same'
-                        ), axis=t_axis, arr=trial_data
-                    )
-    
+        self.model_selection = {
+            'SVM': SVC(random_state = 42),
+            'KNN': KNeighborsClassifier(),
+            'GPC': GaussianProcessClassifier(random_state = 42),
+            'NBC': GaussianNB()
+        }
+        
+        self.model = self.model_selection[model]
+        self.params = params
+        self.boost = boost
+
     def train_test_split(self, n_stim, trials_per_stim, test_size, skip_Y = False):
+        """
+        Build a custom train/test splitter. Gives an equal number of training 
+        and test trial instances for each stimulus.
+        """
         # save arguemnts as attributes
         # to be used by self.fit_timepoints_as_samples
         self.n_stim = n_stim
@@ -116,27 +138,44 @@ class decoder:
         # delete the copy from memory
         del iterX
         
-    def optimize_hyperparams(self, X, Y):
-        #using GridSearchCV to find the optimal values for C and gamma
-        par = {
-            'C':[x+1 for x in range(10)],
-            'gamma':['scale', 'auto', 0.1, 1, 10],
-            'kernel':['rbf']
+    def optimize_hyperparams(self, X, Y, params, method: str):
+        
+        methods = {
+            'BayesSearchCV': BayesSearchCV(
+                self.model,
+                params,
+                cv = 3,
+                scoring = 'accuracy',
+                n_jobs = 4,
+                n_iter = 10,
+                n_points  = 5
+            ),
+            'GridSearchCV': GridSearchCV(
+                self.model,
+                params,
+                cv = 3,
+                scoring = 'accuracy',
+                n_jobs = 4
+            ),
+            'RandomizedSearchCV': RandomizedSearchCV(
+                self.model,
+                params,
+                cv = 3,
+                scoring = 'accuracy',
+                n_jobs = 4,
+                n_iter = 10,
+            )
+            
         }
-
-        hpfitter = GridSearchCV(
-            SVC(),
-            par,
-            cv=5,
-            scoring = 'accuracy',
-            n_jobs = 8
-        )
-
+        
+        hpfitter = methods[method]
         hpfitter.fit(X, Y)
         self.hyperparams = hpfitter.best_params_
         
     def fit_repeats_as_samples(self, fit_mean = False, t = None):
+        
         Y = self.Y_train
+        
         if fit_mean:
             X = scale(self.X_train.mean(2).T)
         else:
@@ -145,20 +184,32 @@ class decoder:
             else:
                 X = scale(self.X_train[:,:,t].T)
                 
-        self.optimize_hyperparams(X, Y)
-        self.model = SVC(
-            C=self.hyperparams['C'], 
-            gamma = self.hyperparams['gamma'], 
-            kernel = self.hyperparams['kernel'], 
-            random_state = 42
-        )
+        if self.params != None:
+            self.optimize_hyperparams(X, Y, self.params['params'], self.params['method'])
+            for key, val, in self.hyperparams.items():
+                self.model.__dict__[key] = val
+        else:
+            pass
+        
+        if self.boost:
+            self.model = AdaBoostClassifier(
+                estimator=self.model, 
+                random_state=42, 
+                algorithm="SAMME", 
+                n_estimators=5
+            )
+        else:
+            pass
 
         #fitting with the optimal parameters
         self.model.fit(X, Y)   
         
-    def fit_timepoints_as_samples(self, window: slice, smoothing = None):
+    def fit_timepoints_as_samples(self, window: slice):
+        
         Y = self.Y
+        
         X = self.X_train
+        
         X = X.reshape(
             X.shape[0], 
             self.n_stim, 
@@ -166,29 +217,36 @@ class decoder:
             X.shape[-1]
         ).mean(2)
         
-        if smoothing == None:
-            pass
-        else:
-            X = self.apply_temporal_smoothing(X, smoothing, 2)
-            
         X = X[:,:,window].reshape(
             X.shape[0], 
             int((window.stop-window.start)*self.n_stim)
         )
         X = scale(X.T)
-        self.optimize_hyperparams(X, Y)
-        self.model = SVC(
-            C=self.hyperparams['C'], 
-            gamma = self.hyperparams['gamma'], 
-            kernel = self.hyperparams['kernel'], 
-            random_state = 42
-        )
+        
+        if self.params != None:
+            self.optimize_hyperparams(X, Y, self.params['params'], self.params['method'])
+            for key, val, in self.hyperparams.items():
+                self.model.__dict__[key] = val
+        else:
+            pass
+        
+        if self.boost:
+            self.model = AdaBoostClassifier(
+                estimator=self.model, 
+                random_state=42, 
+                algorithm="SAMME", 
+                n_estimators=5
+            )
+        else:
+            pass
 
         #fitting with the optimal parameters
         self.model.fit(X, Y)   
         
     def score_repeats_as_samples(self, score_mean = False, t = None):
+        
         Y = self.Y_test
+
         if score_mean:
             X = scale(self.X_test.mean(2).T)
         else:
@@ -203,20 +261,18 @@ class decoder:
         cm = confusion_matrix(Y, pred)
         return score, cm
     
-    def score_timepoints_as_samples(self, window: slice, smoothing = None):
+    def score_timepoints_as_samples(self, window: slice):
+        
         Y = self.Y
+        
         X = self.X_test
+        
         X = X.reshape(
             X.shape[0], 
             self.n_stim, 
             int(self.trials_per_stim*(1-self.test_size)), 
             X.shape[-1]
         ).mean(2)
-        
-        if smoothing == None:
-            pass
-        else:
-            X = self.apply_temporal_smoothing(X, smoothing, 2)
             
         X = X[:,:,window].reshape(
             X.shape[0], 
@@ -229,3 +285,6 @@ class decoder:
         score = (pred==Y).mean()
         cm = confusion_matrix(Y, pred)
         return score, cm
+    
+    def clear_cache(self):
+        self.__dict__ = {}
