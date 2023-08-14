@@ -1,5 +1,9 @@
-## Version 1
+## Version 2
+## Changes:
+# Shuffles were done inplace on the X & Y data structures in version 1,
+# now they are done on deep copies.
 
+# Made some memory utilization optimizations.
 class decoder:
     def __init__(self, X, Y):
         """
@@ -13,71 +17,105 @@ class decoder:
     ## build a custom train/test splitter
     # gives an equal number of training and test
     # trial instances for each stimulus
-    def train_test_split(self, n_stim, trials_per_stim, x_trial_axis, test_size):
+    
+    def apply_temporal_smoothing(self, trial_data, window, t_axis):
+        return np.apply_along_axis(
+                        lambda m: np.convolve(
+                            m, np.ones(window)/window, 
+                            mode='same'
+                        ), axis=t_axis, arr=trial_data
+                    )
+    
+    def train_test_split(self, n_stim, trials_per_stim, test_size, skip_Y = False):
         # save arguemnts as attributes
         # to be used by self.fit_timepoints_as_samples
         self.n_stim = n_stim
         self.trials_per_stim = trials_per_stim
         self.test_size = test_size
         
-        self.stim_indices = np.array(list(
-            zip(
-                list(range(0, n_stim*trials_per_stim, trials_per_stim)),
-                list(range(trials_per_stim, (n_stim*trials_per_stim)+trials_per_stim, trials_per_stim))
-            )
-        ))
-        Y_train = []
-        Y_test = []
-        X_train = []
-        X_test = []
-        for i0, i1 in self.stim_indices:
-
-            ## split X
-
-            # shuffle trials
-            rng = np.random.default_rng()
-            X_stim = self.X[:,i0:i1,:]
-            rng = np.random.default_rng()
-            rng.shuffle(X_stim, axis = x_trial_axis)
-
-            # generate slices
-            x_train_slice = [slice(0,x) for x in list(self.X.shape)]
-            x_train_slice[x_trial_axis] = slice(0, int(trials_per_stim*(1-test_size)))
-            x_train_slice = tuple(x_train_slice)
-
-            x_test_slice = [slice(0,x) for x in list(self.X.shape)]
-            x_test_slice[x_trial_axis] = slice(int(trials_per_stim*(1-test_size)), trials_per_stim)
-            x_test_slice = tuple(x_test_slice)
-
-            # get the slice
-            X_stim_train = X_stim[x_train_slice]
-            X_stim_test = X_stim[x_test_slice]
-            
-            # append to train set and test set
-            X_train.append(X_stim_train)
-            X_test.append(X_stim_test)
-
-            ## split Y
-            
-            # shuffle trials
-            Y_stim = self.Y[i0:i1]
-            random.shuffle(Y_stim)
-
-            # get the slice
-            Y_stim_train = Y_stim[:int(trials_per_stim*(1-test_size))]
-            Y_stim_test = Y_stim[int(trials_per_stim*(1-test_size)):]
-
-            # append to train set and test set
-            Y_train += list(Y_stim_train)
-            Y_test += list(Y_stim_test)
-
-        # concatenate along the trial axis
-        self.X_train = np.concatenate(X_train, axis = x_trial_axis)
-        self.X_test = np.concatenate(X_test, axis = x_trial_axis)
+        # instantiate shuffler
+        rng = np.random.default_rng()
         
-        self.Y_train = Y_train
-        self.Y_test = Y_test
-    
+        # make sure the train/test split is even
+        if trials_per_stim%(1/test_size) != 0:
+            return "Specified test size does not form an even split."
+        
+        # get the number of train/test samples
+        n_test = int(test_size*trials_per_stim)
+        n_train = int((1-test_size)*trials_per_stim)
+
+        ######## split Y ########
+        
+        # delete cache before starting
+        try:
+            del self.Y_train
+        except AttributeError:
+            pass
+        try:
+            del self.Y_test
+        except AttributeError:
+            pass
+        
+        if skip_Y == False:
+            # make a copy of the data structure
+            iterY = copy.deepcopy(self.Y)
+
+            # reshape and shuffle
+            iterY = iterY.reshape(n_stim, trials_per_stim)
+            rng.shuffle(iterY, axis = 1)
+
+            # get the train and test samples and revert to original shape
+            self.Y_test = iterY[:,:n_test].reshape(n_stim*n_test)
+            self.Y_train = iterY[:,n_test:].reshape(n_stim*n_train)
+
+            # delete the copy from memory
+            del iterY
+        else:
+            pass
+        
+        ######## split X ########
+        
+        # delete cache before starting
+        try:
+            del self.X_train
+        except AttributeError:
+            pass
+        try:
+            del self.X_test
+        except AttributeError:
+            pass
+        
+        n_test = int(test_size*trials_per_stim)
+        n_train = int((1-test_size)*trials_per_stim)
+        
+        # make a copy of the data structure
+        if type(self.X) == sparse._coo.core.COO:
+            iterX = self.X.todense()
+        else:
+            iterX = copy.deepcopy(self.X)
+        
+        # reshape and shuffle
+        iterX = iterX.reshape(
+            iterX.shape[0],
+            n_stim,
+            trials_per_stim, 
+            iterX.shape[-1]
+        )
+        rng = np.random.default_rng()
+        rng.shuffle(iterX, axis = 2)
+        
+        # get the train and test samples and revert to original shape
+        self.X_test = iterX[:,:,:n_test,:].reshape(
+            iterX.shape[0],n_stim*n_test,iterX.shape[-1]
+        )
+
+        self.X_train = iterX[:,:,n_test:,:].reshape(
+            iterX.shape[0],n_stim*n_train,iterX.shape[-1]
+        )
+
+        # delete the copy from memory
+        del iterX
+        
     def optimize_hyperparams(self, X, Y):
         #using GridSearchCV to find the optimal values for C and gamma
         par = {
@@ -90,7 +128,8 @@ class decoder:
             SVC(),
             par,
             cv=5,
-            scoring = 'accuracy'
+            scoring = 'accuracy',
+            n_jobs = 8
         )
 
         hpfitter.fit(X, Y)
@@ -117,7 +156,8 @@ class decoder:
         #fitting with the optimal parameters
         self.model.fit(X, Y)   
         
-    def fit_timepoints_as_samples(self, window: slice):
+    def fit_timepoints_as_samples(self, window: slice, smoothing = None):
+        Y = self.Y
         X = self.X_train
         X = X.reshape(
             X.shape[0], 
@@ -125,6 +165,12 @@ class decoder:
             int(self.trials_per_stim*(1-self.test_size)), 
             X.shape[-1]
         ).mean(2)
+        
+        if smoothing == None:
+            pass
+        else:
+            X = self.apply_temporal_smoothing(X, smoothing, 2)
+            
         X = X[:,:,window].reshape(
             X.shape[0], 
             int((window.stop-window.start)*self.n_stim)
@@ -157,7 +203,8 @@ class decoder:
         cm = confusion_matrix(Y, pred)
         return score, cm
     
-    def score_timepoints_as_samples(self, window: slice):
+    def score_timepoints_as_samples(self, window: slice, smoothing = None):
+        Y = self.Y
         X = self.X_test
         X = X.reshape(
             X.shape[0], 
@@ -165,6 +212,12 @@ class decoder:
             int(self.trials_per_stim*(1-self.test_size)), 
             X.shape[-1]
         ).mean(2)
+        
+        if smoothing == None:
+            pass
+        else:
+            X = self.apply_temporal_smoothing(X, smoothing, 2)
+            
         X = X[:,:,window].reshape(
             X.shape[0], 
             int((window.stop-window.start)*self.n_stim)
