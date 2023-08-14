@@ -1,24 +1,11 @@
-## Version 3
+## Version 4
 ## Changes:
 
-# Option to use BayesSearchCV and RandomizedSearchCV hyperparameter optimization
-
-# Added new models: KNN, Gaussian Process, Naive Bayes
-
-# Added Ada boost ensemble
-
-# Made some memory utilization optimizations.
+# Model attribute must be passes as an instance of the model 
 import copy
 import numpy as np
 import sparse
 from sklearn.preprocessing import scale
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.gaussian_process import GaussianProcessClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.ensemble import AdaBoostClassifier
-from sklearn.ensemble import BaggingClassifier
-from sklearn.multiclass import OneVsRestClassifier
 from skopt import BayesSearchCV
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.metrics import confusion_matrix
@@ -27,20 +14,14 @@ class decoder:
     def __init__(self, X, Y, model: str, params = None, boost = False):
         """
         X: Must be a 3D matrix of shape (N(Neurons), N(Trials), N(Timepoints))
-        Y: Must be a 1D array of categorical labels corresponding to the stimulus
-        Shown at each trial. 
+        Y: Must be a 1D array of categorical labels corresponding to the stimulus shown at each trial. 
+        model: Must be an instance of a sklearn classification model
+        params: Must be a dictionary of hyperparameters to be optimized
+        boost: Boolean, default = False
         """
         self.X = X
         self.Y = Y
-        
-        self.model_selection = {
-            'SVM': SVC(random_state = 42),
-            'KNN': KNeighborsClassifier(),
-            'GPC': GaussianProcessClassifier(random_state = 42),
-            'NBC': GaussianNB()
-        }
-        
-        self.model = self.model_selection[model]
+        self.model = model
         self.params = params
         self.boost = boost
 
@@ -112,9 +93,9 @@ class decoder:
         
         # make a copy of the data structure
         if type(self.X) == sparse._coo.core.COO:
-            iterX = self.X.todense()
+            iterX = self.X.todense().astype(np.int16)
         else:
-            iterX = copy.deepcopy(self.X)
+            iterX = copy.deepcopy(self.X).astype(np.int16)
         
         # reshape and shuffle
         iterX = iterX.reshape(
@@ -146,7 +127,6 @@ class decoder:
                 params,
                 cv = 3,
                 scoring = 'accuracy',
-                n_jobs = 4,
                 n_iter = 10,
                 n_points  = 5
             ),
@@ -154,15 +134,13 @@ class decoder:
                 self.model,
                 params,
                 cv = 3,
-                scoring = 'accuracy',
-                n_jobs = 4
+                scoring = 'accuracy'
             ),
             'RandomizedSearchCV': RandomizedSearchCV(
                 self.model,
                 params,
                 cv = 3,
                 scoring = 'accuracy',
-                n_jobs = 4,
                 n_iter = 10,
             )
             
@@ -193,7 +171,7 @@ class decoder:
         
         if self.boost:
             self.model = AdaBoostClassifier(
-                estimator=self.model, 
+                base_estimator=self.model, 
                 random_state=42, 
                 algorithm="SAMME", 
                 n_estimators=5
@@ -232,7 +210,7 @@ class decoder:
         
         if self.boost:
             self.model = AdaBoostClassifier(
-                estimator=self.model, 
+                base_estimator=self.model, 
                 random_state=42, 
                 algorithm="SAMME", 
                 n_estimators=5
