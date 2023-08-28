@@ -1,10 +1,15 @@
-## Version 4
+## Version 5
 ## Changes:
 
-# Model attribute must be passes as an instance of the model 
+# the optimize_hyperparams method is now an independent method 
+# removed the fit_timepoints_as_samples and score_timepoints_as_samples method
+# the fit_repeats_as_samples and score_repeats_as_samples methods have been reneamed to just "fit" and "score"
+# added the cross_validate method for k fold cross validation & enabled multiprocessing for cross validation
+
 import copy
 import numpy as np
 import sparse
+from multiprocessing import Process, Manager
 from sklearn.preprocessing import scale
 from skopt import BayesSearchCV
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
@@ -24,6 +29,7 @@ class decoder:
         self.model = model
         self.params = params
         self.boost = boost
+        self.mgr = Manager()
 
     def train_test_split(self, n_stim, trials_per_stim, test_size, skip_Y = False):
         """
@@ -31,10 +37,11 @@ class decoder:
         and test trial instances for each stimulus.
         """
         # save arguemnts as attributes
-        # to be used by self.fit_timepoints_as_samples
+        # to be used by self.cross_validate
         self.n_stim = n_stim
-        self.trials_per_stim = trials_per_stim
-        self.test_size = test_size
+        
+        # to be used by self.optimize_hyperparams
+        self.skip_Y = skip_Y
         
         # instantiate shuffler
         rng = np.random.default_rng()
@@ -119,12 +126,12 @@ class decoder:
         # delete the copy from memory
         del iterX
         
-    def optimize_hyperparams(self, X, Y, params, method: str):
+    def optimize_hyperparams(self, X, Y):
         
         methods = {
             'BayesSearchCV': BayesSearchCV(
                 self.model,
-                params,
+                self.params['params'],
                 cv = 3,
                 scoring = 'accuracy',
                 n_iter = 10,
@@ -132,13 +139,13 @@ class decoder:
             ),
             'GridSearchCV': GridSearchCV(
                 self.model,
-                params,
+                self.params['params'],
                 cv = 3,
                 scoring = 'accuracy'
             ),
             'RandomizedSearchCV': RandomizedSearchCV(
                 self.model,
-                params,
+                self.params['params'],
                 cv = 3,
                 scoring = 'accuracy',
                 n_iter = 10,
@@ -146,11 +153,13 @@ class decoder:
             
         }
         
-        hpfitter = methods[method]
+        hpfitter = methods[self.params['method']]
         hpfitter.fit(X, Y)
         self.hyperparams = hpfitter.best_params_
+        for key, val, in self.hyperparams.items():
+                self.model.__dict__[key] = val
         
-    def fit_repeats_as_samples(self, fit_mean = False, t = None):
+    def fit(self, fit_mean = False, t = None):
         
         Y = self.Y_train
         
@@ -161,13 +170,6 @@ class decoder:
                 return "A time slice must be given."
             else:
                 X = scale(self.X_train[:,:,t].T)
-                
-        if self.params != None:
-            self.optimize_hyperparams(X, Y, self.params['params'], self.params['method'])
-            for key, val, in self.hyperparams.items():
-                self.model.__dict__[key] = val
-        else:
-            pass
         
         if self.boost:
             self.model = AdaBoostClassifier(
@@ -182,46 +184,8 @@ class decoder:
         #fitting with the optimal parameters
         self.model.fit(X, Y)   
         
-    def fit_timepoints_as_samples(self, window: slice):
         
-        Y = self.Y
-        
-        X = self.X_train
-        
-        X = X.reshape(
-            X.shape[0], 
-            self.n_stim, 
-            int(self.trials_per_stim*(1-self.test_size)), 
-            X.shape[-1]
-        ).mean(2)
-        
-        X = X[:,:,window].reshape(
-            X.shape[0], 
-            int((window.stop-window.start)*self.n_stim)
-        )
-        X = scale(X.T)
-        
-        if self.params != None:
-            self.optimize_hyperparams(X, Y, self.params['params'], self.params['method'])
-            for key, val, in self.hyperparams.items():
-                self.model.__dict__[key] = val
-        else:
-            pass
-        
-        if self.boost:
-            self.model = AdaBoostClassifier(
-                base_estimator=self.model, 
-                random_state=42, 
-                algorithm="SAMME", 
-                n_estimators=5
-            )
-        else:
-            pass
-
-        #fitting with the optimal parameters
-        self.model.fit(X, Y)   
-        
-    def score_repeats_as_samples(self, score_mean = False, t = None):
+    def score(self, score_mean = False, t = None):
         
         Y = self.Y_test
 
@@ -239,30 +203,126 @@ class decoder:
         cm = confusion_matrix(Y, pred)
         return score, cm
     
-    def score_timepoints_as_samples(self, window: slice):
+    def _run_fold(
+            self,
+            Xtrain, Xtest,
+            Ytrain, Ytest,
+            models, scores, cms,
+            optimize
+    ):
+        if optimize:
+            self.optimize_hyperparams(Xtrain, Ytrain)
+        model = copy.deepcopy(self.model)
+        model.fit(Xtrain, Ytrain)
+
+        ## get the score and the confusion matrix
+        pred = model.predict(Xtest)
+        score = (pred==Ytest).mean()
+        cm = confusion_matrix(Ytest, pred)
+
+        ## append data to collection lists
+        models.append(model)
+        scores.append(score)
+        cms.append(cm)
+
+        # clear the fold data from memory
+        del Xtrain;del Xtest
+        del Ytrain;del Ytest
+        del score;del cm
         
-        Y = self.Y
-        
-        X = self.X_test
-        
-        X = X.reshape(
-            X.shape[0], 
+    def cross_validate(self, k, t, optimize = False):
+        trials_per_stim = int(self.X_train.shape[1]/self.n_stim)
+        if trials_per_stim%k != 0:
+            return "Number of folds does not divide evenly into the number of trials per stimulus."
+        else:
+            stim_per_fold = int(trials_per_stim/k)
+
+        ## Reshape X_train
+        X_cv = self.X_train.reshape(
+            self.X_train.shape[0], 
             self.n_stim, 
-            int(self.trials_per_stim*(1-self.test_size)), 
-            X.shape[-1]
-        ).mean(2)
-            
-        X = X[:,:,window].reshape(
-            X.shape[0], 
-            int((window.stop-window.start)*self.n_stim)
+            trials_per_stim, 
+            self.X_train.shape[-1]
         )
-        X = scale(X.T) 
+
+        X_cv = X_cv.reshape(
+            self.X_train.shape[0], # dim 0 = Neurons
+            self.n_stim, # dim 1 = Stims
+            k, # dim 2 = folds
+            stim_per_fold, # dim 3 = stim trials per fold
+            self.X_train.shape[-1] # dim 4 = time
+        )
+
+        ## Reshape Y_train
+        Y_cv = self.Y_train.reshape(self.n_stim, trials_per_stim)
+        Y_cv = Y_cv.reshape(
+            self.n_stim, # dim 0 = Stims
+            k, # dim 1 = folds
+            stim_per_fold # dim 2 = stim trials per fold
+        )
+
+        ## initialize lists to store the data for each fold
+      
+        models = self.mgr.list()
+        scores = self.mgr.list()
+        cms = self.mgr.list()
         
-        #evaluating accuracy
-        pred = self.model.predict(X)
-        score = (pred==Y).mean()
-        cm = confusion_matrix(Y, pred)
-        return score, cm
+        # list to hold the processes
+        processes = []
+        
+        ## iterate through the folds
+        for i in range(X_cv.shape[2]):
+            
+            # create a mask to index all but the test set
+            mask = np.ones(X_cv.shape[2], dtype = bool)
+            mask[i] = 0
+
+            # get the X test set
+            Xtest = X_cv[:,:,i,:,:].reshape(
+                X_cv.shape[0], # dim 0 = neurons
+                X_cv.shape[1]*X_cv.shape[3], # dim 1 = stims x stim trials per fold
+                X_cv.shape[-1] # dim 2 = time
+            )
+
+            # get the Y test set
+            Ytest = Y_cv[:,i,:].reshape(
+                Y_cv.shape[0]*Y_cv.shape[2]
+            )
+
+            # get the X train set
+            Xtrain = X_cv[:,:,mask,:,:].reshape(
+                X_cv.shape[0],
+                X_cv.shape[1]*X_cv.shape[3]*(X_cv.shape[2]-1),
+                X_cv.shape[-1]
+            )
+
+            # get the Y train set
+            Ytrain = Y_cv[:,mask,:].reshape(
+                Y_cv.shape[0]*Y_cv.shape[2]*(Y_cv.shape[1]-1)
+            )
+
+            ## fit the model
+            processes.append(
+                Process(
+                target = self._run_fold,
+                args = (
+                        scale(Xtrain[:,:,t].T), scale(Xtest[:,:,t].T), 
+                        Ytrain, Ytest, 
+                        models, scores, cms,
+                        optimize
+                    )
+                )
+            )
+            # clear the fold data from memory
+            del Xtrain;del Xtest
+            del Ytrain;del Ytest
+            
+        ## start and join the processes
+        [p.start() for p in processes]
+        [p.join() for p in processes]
+
+        del X_cv;del Y_cv
+        return list(models), list(scores), list(cms)
     
     def clear_cache(self):
         self.__dict__ = {}
