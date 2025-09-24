@@ -85,9 +85,11 @@ class preprocess_single_trial_data:
                 list(range(n_trials, int((n_stim*n_trials)+n_trials), n_trials))
             )
         )
-        n_samples = n_trials/n_avg
-        if n_samples%2 != 0:
-            return "n_trials/n_avg must be a whole number"
+        
+        if n_trials%n_avg != 0:
+            raise _NotAFactor(n_avg, n_trials)
+        else:
+            n_samples = n_trials/n_avg
 
         trial_averaged_samples = []
         for sf in sf_indices:
@@ -111,3 +113,14 @@ class preprocess_single_trial_data:
                             mode='same'
                         ), axis=t_axis, arr=trial_data
                     )
+class _NotAFactor(Exception):
+    """
+    Exception raised for when n_avg is not a factor 
+    of n_trials.
+    """
+
+    def __init__(self, arg0, arg1):
+        self.message = f"""
+        n_avg ({arg0}) is not a factor of n_trials ({arg1}).
+        """
+        super().__init__(self.message)

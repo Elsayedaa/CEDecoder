@@ -1,57 +1,13 @@
-## Version 7
+## Version 8
 ## Changes:
 
-## Three different time embedding strategies are now available for the decoder: 
-## - Feature embedding: a time invariant model where time is embedded in the 
-##   feature/column space of independent variable matrix X
-## - Sample embedding: a time invariant model where time is embedded in the
-##   sample/row space of the independent variable matrix X
-## - Hybrid embedding: a time invariant model where time is embedded in both
-##   the feature/column space and the sample/row space of the independent
-##   variable matrix X
+## Reworked timepoint embedding: 
+## - Hybrid embedding removed
+## - Feature embedding can now be done for a particular lag as well as the full time span
+## - Sample embedding is not changed.
 
 ## Using the embedding strategies:
-## - When calling the decoder.fit() method, the user must pass one of the
-##   following 3 arguments for time embedding: 
-##      - t = 'feature_embed'
-##      - t = 'sample_embed'
-##      - t = 'hybrid_embed'
-## - The user must also pass the embedding_params keyword argument to the
-##   decoder.fit() method. The following keyword arguments must be passed
-##   in each case:
-##      - decoder.fit(t = 'feature_embed', embedding_params = {'time_range': tuple}) 
-##      - decoder.fit(t = 'sample_embed', embedding_params = {'time_range': tuple}) 
-##      - decoder.fit(t = 'hybrid_embed', embedding_params = {'time_range': tuple, 'time_lag': int}) 
-## 
-## - When calling the decoder.score(), the user can either pass the same time embedding used in 
-##   decoder.fit() for the t parameter or pass a single timepoint. Passing the same time embedding
-##   yeilds a single decoding accuracy score across the entire timecourse of the neural response. 
-##   Passing a single timepoint yeilds a single decoding accuracy score for the given time slice
-##   in the neural response. If the same time embedding is used for scorring, The decoder.score() 
-##   method will use the same embedding_params used in the decoder.fit() method. 
-## - Example:
-##      - decoder.fit(t = 'feature_embed', embedding_params = {'time_range': tuple}) 
-##      - decoder.score(t = 'feature_embed')
-##
-##                           or
-##
-##      - decoder.fit(t = 'feature_embed', embedding_params = {'time_range': tuple}) 
-##      - decoder.score(t = 90)
-
-## Using the embedding strategies with cross validation:
-## - When calling the decoder.cross_validate() method, the user must pass an additional 
-##   keyword to the embedding_params keyword argument.
-##      - embedding_params = {'strategy': str}
-## - The user should pass one of the following strings corresponding to the strategy keyword:
-##      - embedding_params = {'strategy': 'full'}: performs decoding across all time, yeilding
-##        a single decoding accuracy score for the entire timecourse of the neural response.
-##        this is equivalent to calling decoder.score() where t is set to a time embedding 
-##        strategy rather than a timepoint.
-##      - embedding_params = {'strategy': 'timepoint'}: performs decoding at each time slice, yielding
-##        a decoding accuracy score fore each timepoint in the neural response. This is equivalent to
-##        calling decoder.score() where t is set to a timepoint rather than a time embedding strategy
-##        To use the timepoint strategy with feature embedding, the test dataset is hybrid embedded 
-##        with a time lag that is equal to the time range. 
+## - Instructions for using the embedding strategies are now in the documentation and docstrings.
 
 import copy
 import numpy as np
@@ -59,6 +15,8 @@ import sparse
 from multiprocessing import Process, Manager
 from sklearn.preprocessing import StandardScaler
 from skopt import BayesSearchCV
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.decomposition import PCA
 from sklearn.ensemble import AdaBoostClassifier
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.metrics import confusion_matrix
@@ -76,13 +34,14 @@ class decoder:
         """
         self.X = X
         self.Y = Y
+        self.n_neurons = X.shape[0]
         self.Ydim = len(Y.shape)
         self.model = model
         self.params = params
         self.boost = boost
         self.mgr = Manager()
         self.labels = labels
-        self.test_data_prepared = False
+        self.dim_reduc = None
         
     def onehot_to_labels(self, onehot, labels):
         return np.array([
@@ -225,110 +184,85 @@ class decoder:
         for key, val, in self.hyperparams.items():
                 self.model.__dict__[key] = val
                 
-    def feature_embed_time(self, X, time_range):
-        X = X[:,:,time_range[0]:time_range[1]]
+    def feature_embed_time(self, X, t, lag):
+        if t-lag<0:
+            raise _LagTooLong(lag, t)
+            
+        X = X[:,:,t-lag:t+1]
         duration = X.shape[2]
         n_trials = X.shape[1]
         n_neurons = X.shape[0]
-
-        X = np.array([trial.T for trial in X])
+       
+        X = X.transpose(0,2,1)
         return X.reshape(n_neurons*duration, n_trials)
     
-    def sample_embed_time(self, X, time_range):
-        X = X[:,:,time_range[0]:time_range[1]]
+    def sample_embed_time(self, X, t, lag):
+        if t-lag<0:
+            raise _LagTooLong(lag, t)
+            
+        X = X[:,:,t-lag:t+1]
         duration = X.shape[2]
         n_trials = X.shape[1]
         n_neurons = X.shape[0]
-
+        
         return X.reshape(n_neurons, duration*n_trials)
-        
-    def hybrid_embed_time(self, X, time_lag, time_range):
-        duration = len(range(time_range[0], time_range[1]))
-        n_trials = X.shape[1]
-        n_neurons = X.shape[0]
-        
-        return np.array(
-            [
-                np.array(
-                    [
-                        X[x,:,t:t+time_lag].T 
-                        for x in range(n_neurons)
-                    ]
-                ).reshape(n_neurons*time_lag, n_trials).T 
-                for t in range(time_range[0], time_range[1])
-            ], 
-            dtype = np.int16
-        ).T.reshape(n_neurons*time_lag, n_trials*duration)
     
-    def fit(self, t = None, **embedding_params):
+    def reduce_dimensions(self, X, Y, method):
+        if method == 'pls':
+            pls = PLSRegression(10)
+            return pls.fit_transform(X, Y)[0]
+        if method == 'pca':
+            pca = PCA()
+            return pca.fit_transform(X)[:,:self.n_neurons]
+    
+    def fit(self, t = None, dim_reduc = None, **embedding_params):
         
+        self.scaler = StandardScaler()
         if self.Ydim == 1:
             Y = self.Y_train
         elif self.Ydim > 2:
             raise _InvalidYDim(self.Ydim)
         else:
             Y = self.Y_train.T
-        
-        if t == 'sample_embed':
-            must_inclued_kwargs = ['time_range']
-            for kwarg in must_inclued_kwargs:
-                if kwarg not in embedding_params['embedding_params'].keys():
-                    raise _NoDelayEmbeddingArgs(kwarg)
-            self.time_embedding = 'sample'
+            
+        if t == None:
+            raise _NoTimeSliceGiven("fit")
+            
+        if embedding_params:
+            if 'space' not in embedding_params['embedding_params'].keys():
+                raise _MissingEmbeddingArgs('space')
+                
+            if 'lag' not in embedding_params['embedding_params'].keys():
+                raise _MissingEmbeddingArgs('lag')
+                                      
+            # extract the embedding parameters         
             self.embedding_params = embedding_params['embedding_params']
+            self.space_selection = self.embedding_params['space']        
+            lag = self.embedding_params['lag']
             
-            # extract the embedding parameters   
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-            
-            self.scaler = StandardScaler()
-            n_trials = self.X_train.shape[1]
-            X = self.scaler.fit_transform(self.sample_embed_time(self.X_train, time_range).T)
-            Y = np.array([np.array([i]*duration) for i in Y]).reshape(n_trials*duration,self.n_stim)
-            
-        elif t == 'feature_embed':
-            must_inclued_kwargs = ['time_range']
-            for kwarg in must_inclued_kwargs:
-                if kwarg not in embedding_params['embedding_params'].keys():
-                    raise _NoDelayEmbeddingArgs(kwarg)
-            self.time_embedding = 'feature'
-            self.embedding_params = embedding_params['embedding_params']
+            if self.space_selection == 'feature':
+                X = self.feature_embed_time(self.X_train, t, lag)
+                X = self.scaler.fit_transform(X.T)
+                
+            elif self.space_selection == 'sample':
+                X = self.sample_embed_time(self.X_train, t, lag)
+                X = self.scaler.fit_transform(X.T)
+                
+                # extend Y training data to match
+                if self.Ydim == 1:
+                    Y = np.array([
+                        np.array([i]*lag) for i in Y
+                    ]).flatten()
                     
-            # extract the embedding parameters        
-            time_range = self.embedding_params['time_range']
-            
-            self.scaler = StandardScaler()
-            X = self.scaler.fit_transform(self.feature_embed_time(self.X_train, time_range).T)
-            
-        elif t == 'hybrid_embed':
-            must_inclued_kwargs = ['time_lag', 'time_range']
-            for kwarg in must_inclued_kwargs:
-                if kwarg not in embedding_params['embedding_params'].keys():
-                    raise _NoDelayEmbeddingArgs(kwarg)
-            self.time_embedding = 'hybrid'
-            self.embedding_params = embedding_params['embedding_params']
-                    
-            # extract the embedding parameters        
-            time_lag = self.embedding_params['time_lag']
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-            
-            
-            self.scaler = StandardScaler()
-            n_trials = self.X_train.shape[1]
-            X = self.scaler.fit_transform(self.hybrid_embed_time(self.X_train, time_lag, time_range).T)
-            
-            # extend the Y data to match
-            Y = np.array([np.array([i]*duration) for i in Y]).reshape(n_trials*duration,self.n_stim)
-            
-        else:
-            if t == None:
-                raise _NoTimeSliceGiven("fit")
+                elif self.Ydim == 2:
+                    Y = np.array([
+                        np.array([i]*(lag+1)) for i in Y
+                    ]).reshape(X.shape[0], self.n_stim)                  
             else:
-                self.time_embedding = None
-                self.scaler = StandardScaler()
-                X = self.scaler.fit_transform(self.X_train[:,:,t].T)
-        
+                raise _InvalidSpaceArg(space_selection)
+        else:
+            X = self.scaler.fit_transform(self.X_train[:,:,t].T) 
+
         if self.boost:
             self.model = AdaBoostClassifier(
                 base_estimator=self.model, 
@@ -340,35 +274,12 @@ class decoder:
             pass
 
         #fitting with the optimal parameters
-        self.model.fit(X, Y)   
-    
-    def prepare_test_data(self):
-        if self.time_embedding == None:
-            self.test_data_prepared = True
-        elif self.time_embedding == 'sample':
-            time_range = self.embedding_params['time_range']
-            self.X_test = self.X_test[:,:,time_range[0]:time_range[1]]
-            
-        elif self.time_embedding == 'feature':
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-            time_lag = duration
-
-            self.X_test = self.hybrid_embed_time(self.X_test, time_lag, time_range).reshape(
-                self.X_test.shape[0]*time_lag, self.X_test.shape[1], duration
-            )
-            self.test_data_prepared = True
-
-        elif self.time_embedding == 'hybrid':
-            time_lag = self.embedding_params['time_lag']
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-
-            self.X_test = self.hybrid_embed_time(self.X_test, time_lag, time_range).reshape(
-                self.X_test.shape[0]*time_lag, self.X_test.shape[1], duration
-            )
-            self.test_data_prepared = True
-            
+        
+        if dim_reduc != None:
+            self.dim_reduc = dim_reduc
+            X = self.reduce_dimensions(X, Y, dim_reduc)
+        self.model.fit(X, Y)  
+        
     def score(self, t = None):
         
         if self.Ydim == 1:
@@ -377,38 +288,39 @@ class decoder:
             raise _InvalidYDim(self.Ydim)
         else:
             Y = self.Y_test.T
-
-        if t == 'sample_embed':
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-            n_trials = self.X_test.shape[1]
-            X = self.scaler.transform(self.sample_embed_time(self.X_test, time_range).T)
-            Y = np.array([np.array([i]*duration) for i in Y]).reshape(n_trials*duration,self.n_stim)
-      
-        elif t == 'feature_embed':
-            time_range = self.embedding_params['time_range']
-            X = self.scaler.transform(self.feature_embed_time(self.X_test, time_range).T)
-
-        elif t == 'hybrid_embed':
-            time_lag = self.embedding_params['time_lag']
-            time_range = self.embedding_params['time_range']
-            duration = len(range(time_range[0], time_range[1]))
-            n_trials = self.X_test.shape[1]
-            X = self.scaler.transform(self.hybrid_embed_time(self.X_test, time_lag, time_range).T)
-            Y = np.array([np.array([i]*duration) for i in Y]).reshape(n_trials*duration,self.n_stim)
-        else:
-            if t == None:
-                raise _NoTimeSliceGiven("score")
+            
+        if t == None:
+            raise _NoTimeSliceGiven("score")
+            
+        try:
+            lag = self.embedding_params['lag']
+            if self.space_selection == 'feature':
+                X = self.feature_embed_time(self.X_test, t, lag)              
+                X = self.scaler.fit_transform(X.T)
+                
+            elif self.space_selection == 'sample':
+                X = self.sample_embed_time(self.X_test, t, lag)
+                X = self.scaler.fit_transform(X.T)
+                
+                # extend Y test data to match
+                if self.Ydim == 1:
+                    Y = np.array([
+                        np.array([i]*lag) for i in Y
+                    ]).flatten()
+                    
+                elif self.Ydim == 2:
+                    Y = np.array([
+                        np.array([i]*(lag+1)) for i in Y
+                    ]).reshape(X.shape[0], self.n_stim)  
                 
             else:
-                if self.test_data_prepared == True:
-                    pass
-                else:
-                    self.prepare_test_data()
-                    
-                X = self.scaler.transform(self.X_test[:,:,t].T)
+                raise _InvalidSpaceArg(space_selection)
+        except AttributeError:  
+            X = self.scaler.transform(self.X_test[:,:,t].T)
                 
         #evaluating accuracy
+        if self.dim_reduc != None:
+            X = self.reduce_dimensions(X, Y, self.dim_reduc)
         pred = self.model.predict(X)
         
         if self.Ydim == 1:
@@ -430,8 +342,7 @@ class decoder:
             Xtrain, Xtest,
             Ytrain, Ytest,
             models, scores, cms,
-            optimize, strategy,
-            *args
+            optimize, *args
     ):
         if optimize:
             self.optimize_hyperparams(Xtrain, Ytrain)
@@ -439,38 +350,18 @@ class decoder:
         model.fit(Xtrain, Ytrain)
 
         ## get the score and the confusion matrix
-        if strategy == 'timepoint':
-            duration = args[0]
-            score = np.zeros(duration)
-            cm = np.zeros((duration, self.n_stim, self.n_stim))
-            for t in range(duration):
-                xtest = self.scaler.transform(Xtest[:,:,t].T)
-                pred = model.predict(xtest)
-                if self.Ydim == 1:
-                    score[t] = (pred==Ytest).mean()
-                if self.Ydim == 2:
-                    score[t] = np.all(np.equal(pred, Ytest), axis=1).mean(0)
-                    
-                if np.all(self.labels != None):
-                    truelabels = self.onehot_to_labels(Ytest, self.labels)
-                    predictedlabels = self.onehot_to_labels(pred, self.labels)
-                    cm[t] = confusion_matrix(truelabels, predictedlabels)
-                else:
-                    cm[t] = confusion_matrix(Ytest, pred)
-        elif strategy == 'full':
-            #xtest = self.scaler.transform(Xtest)
-            pred = model.predict(Xtest)
-            if self.Ydim == 1:
-                score = (pred==Ytest).mean()
-            if self.Ydim == 2:
-                score = np.all(np.equal(pred, Ytest), axis=1).mean(0)
-            
-            if np.all(self.labels != None):
-                truelabels = self.onehot_to_labels(Ytest, self.labels)
-                predictedlabels = self.onehot_to_labels(pred, self.labels)
-                cm = confusion_matrix(truelabels, predictedlabels)
-            else:
-                cm = confusion_matrix(Ytest, pred)
+        pred = model.predict(Xtest)
+        if self.Ydim == 1:
+            score = (pred==Ytest).mean()
+        if self.Ydim == 2:
+            score = np.all(np.equal(pred, Ytest), axis=1).mean(0)
+
+        if np.all(self.labels != None):
+            truelabels = self.onehot_to_labels(Ytest, self.labels)
+            predictedlabels = self.onehot_to_labels(pred, self.labels)
+            cm = confusion_matrix(truelabels, predictedlabels)
+        else:
+            cm = confusion_matrix(Ytest, pred)
 
         ## append data to collection lists
         models.append(model)
@@ -483,6 +374,7 @@ class decoder:
         del score;del cm
         
     def cross_validate(self, k, t, optimize = False, **embedding_params):
+        
         trials_per_stim = int(self.X_train.shape[1]/self.n_stim)
         if trials_per_stim%k != 0:
             m = f"""
@@ -590,162 +482,105 @@ class decoder:
                 ).T      
 
             ## fit the model
-            if t == 'sample_embed':     
-                must_inclued_kwargs = ['time_range', 'strategy']
-                for kwarg in must_inclued_kwargs:
-                    if kwarg not in embedding_params['embedding_params'].keys():
-                        raise _NoDelayEmbeddingArgs(kwarg)
-                self.time_embedding = 'sample'
-                self.embedding_params = embedding_params['embedding_params']
+            self.scaler = StandardScaler()
+            
+            if t == None:
+                raise _NoTimeSliceGiven("fit")
 
-                # extract the embedding parameters   
-                time_range = self.embedding_params['time_range']
-                duration = len(range(time_range[0], time_range[1]))
-                
-                # prepare the X training data
-                self.scaler = StandardScaler()
-                n_trials = Xtrain.shape[1]
-                Xtrain = self.scaler.fit_transform(self.sample_embed_time(Xtrain, time_range).T)
-                
-                # extend Y training data to match
-                Ytrain = np.array([np.array([i]*duration) for i in Ytrain]).reshape(n_trials*duration,self.n_stim)               
-                
-                # prepare the X test data according to the decoding strategy
-                if self.embedding_params['strategy'] == 'full':
-                    strategy = 'full'
-                    time_range = self.embedding_params['time_range']
-                    duration = len(range(time_range[0], time_range[1]))
-                    n_trials = Xtest.shape[1]
-                    Xtest = self.scaler.transform(self.sample_embed_time(Xtest, time_range).T)
-                    Ytest = np.array([np.array([i]*duration) for i in Ytest]).reshape(n_trials*duration,self.n_stim)
+            if embedding_params:
+                if 'space' not in embedding_params['embedding_params'].keys():
+                    raise _MissingEmbeddingArgs('space')
+
+                if 'lag' not in embedding_params['embedding_params'].keys():
+                    raise _MissingEmbeddingArgs('lag')
+
+                # extract the embedding parameters         
+                self.embedding_params = embedding_params['embedding_params']
+                self.space_selection = self.embedding_params['space']        
+                lag = self.embedding_params['lag']
+
+                if self.space_selection == 'feature':
                     
-                elif self.embedding_params['strategy'] == 'timepoint':
-                    strategy = 'timepoint'
-                    time_range = self.embedding_params['time_range']
-                    Xtest = Xtest[:,:,time_range[0]:time_range[1]]
+                    # prepare Xtrain
+                    Xtrain = self.feature_embed_time(Xtrain, t, lag)
+                    Xtrain = self.scaler.fit_transform(Xtrain.T)
                     
-                processes.append(
-                    Process(
-                    target = self._run_fold,
-                    args = (
-                            Xtrain, Xtest, 
-                            Ytrain, Ytest, 
-                            models, scores, cms,
-                            optimize, strategy, duration
+                    # prepare Xtest
+                    Xtest = self.feature_embed_time(Xtest, t, lag)
+                    Xtest = self.scaler.fit_transform(Xtest.T)
+                    processes.append(
+                        Process(
+                        target = self._run_fold,
+                        args = (
+                                Xtrain, Xtest, 
+                                Ytrain, Ytest, 
+                                models, scores, cms,
+                                optimize, lag
+                            )
                         )
                     )
-                )
-                
-            elif t == 'feature_embed':
-                must_inclued_kwargs = ['time_range']
-                for kwarg in must_inclued_kwargs:
-                    if kwarg not in embedding_params['embedding_params'].keys():
-                        raise _NoDelayEmbeddingArgs(kwarg)
-                self.time_embedding = 'feature'
-                self.embedding_params = embedding_params['embedding_params']
-
-                # extract the embedding parameters        
-                time_range = self.embedding_params['time_range']
-                
-                # prepare the X training data
-                self.scaler = StandardScaler()
-                Xtrain = self.scaler.fit_transform(self.feature_embed_time(Xtrain, time_range).T)
-                
-                 # prepare the X test data according to the decoding strategy
-                if self.embedding_params['strategy'] == 'full':
-                    strategy = 'full'
-                    time_range = self.embedding_params['time_range']
-                    duration = len(range(time_range[0], time_range[1]))
-                    Xtest = self.scaler.transform(self.feature_embed_time(Xtest, time_range).T)
+                elif self.space_selection == 'sample':
                     
-                elif self.embedding_params['strategy'] == 'timepoint':
-                    strategy = 'timepoint'
-                    time_range = self.embedding_params['time_range']
-                    duration = len(range(time_range[0], time_range[1]))
-                    time_lag = duration
-
-                    Xtest = self.hybrid_embed_time(Xtest, time_lag, time_range).reshape(
-                        Xtest.shape[0]*time_lag, Xtest.shape[1], duration
-                    )
+                    # prepare Xtrain
+                    Xtrain = self.sample_embed_time(Xtrain, t, lag)
+                    Xtrain = self.scaler.fit_transform(Xtrain.T)
                     
-                processes.append(
-                    Process(
-                    target = self._run_fold,
-                    args = (
-                            Xtrain, Xtest, 
-                            Ytrain, Ytest, 
-                            models, scores, cms,
-                            optimize, strategy, duration
+                    # prepare Xtest
+                    Xtest = self.sample_embed_time(Xtest, t, lag)
+                    Xtest = self.scaler.fit_transform(Xtest.T)
+                    
+                    # extend Y training data to match
+                    if self.Ydim == 1:
+                        Ytrain = np.array([
+                            np.array([i]*lag) for i in Ytrain
+                        ]).flatten()
+                        
+                    elif self.Ydim == 2:
+                        Ytrain = np.array([
+                            np.array([i]*(lag+1)) for i in Ytrain
+                        ]).reshape(Xtrain.shape[0], self.n_stim)   
+                        
+                    # extend Y test data to match
+                    if self.Ydim == 1:
+                        Ytest = np.array([
+                            np.array([i]*lag) for i in Ytest
+                        ]).flatten()
+                        
+                    elif self.Ydim == 2:
+                        Ytest = np.array([
+                            np.array([i]*(lag+1)) for i in Ytest
+                        ]).reshape(Xtest.shape[0], self.n_stim)  
+                        
+                    processes.append(
+                        Process(
+                        target = self._run_fold,
+                        args = (
+                                Xtrain, Xtest, 
+                                Ytrain, Ytest, 
+                                models, scores, cms,
+                                optimize, lag
+                            )
                         )
                     )
-                )
                     
-            elif t == 'hybrid_embed':
-                must_inclued_kwargs = ['time_lag', 'time_range']
-                for kwarg in must_inclued_kwargs:
-                    if kwarg not in embedding_params['embedding_params'].keys():
-                        raise _NoDelayEmbeddingArgs(kwarg)
-                self.time_embedding = 'hybrid'
-                self.embedding_params = embedding_params['embedding_params']
-
-                # extract the embedding parameters        
-                time_lag = self.embedding_params['time_lag']
-                time_range = self.embedding_params['time_range']
-                duration = len(range(time_range[0], time_range[1]))
-
-                # prepare the X training data
-                self.scaler = StandardScaler()
-                n_trials = Xtrain.shape[1]
-                Xtrain = self.scaler.fit_transform(self.hybrid_embed_time(Xtrain, time_lag, time_range).T)
-
-                # extend the Y data to match
-                Ytrain = np.array([np.array([i]*duration) for i in Ytrain]).reshape(n_trials*duration,self.n_stim)
-                
-                 # prepare the X test data according to the decoding strategy
-                if self.embedding_params['strategy'] == 'full':
-                    strategy = 'full'
-                    time_lag = self.embedding_params['time_lag']
-                    time_range = self.embedding_params['time_range']
-                    duration = len(range(time_range[0], time_range[1]))
-                    n_trials = Xtest.shape[1]
-                    Xtest = self.scaler.transform(self.hybrid_embed_time(Xtest, time_lag, time_range).T)
-                    Ytest = np.array([np.array([i]*duration) for i in Ytest]).reshape(n_trials*duration,self.n_stim)
-                    
-                elif self.embedding_params['strategy'] == 'timepoint':
-                    strategy = 'timepoint'
-                    time_lag = self.embedding_params['time_lag']
-                    time_range = self.embedding_params['time_range']
-                    duration = len(range(time_range[0], time_range[1]))
-
-                    Xtest = self.hybrid_embed_time(Xtest, time_lag, time_range).reshape(
-                        Xtest.shape[0]*time_lag, Xtest.shape[1], duration
-                    )
-                    
-                processes.append(
-                    Process(
-                    target = self._run_fold,
-                    args = (
-                            Xtrain, Xtest, 
-                            Ytrain, Ytest, 
-                            models, scores, cms,
-                            optimize, strategy, duration
-                        )
-                    )
-                )
+                else:
+                    raise _InvalidSpaceArg(space_selection)
             else:
-                self.scaler = StandardScaler()
+                Xtrain = self.scaler.fit_transform(Xtrain[:,:,t].T) 
+                Xtest = self.scaler.transform(Xtest[:,:,t].T)               
+        
                 processes.append(
                     Process(
                     target = self._run_fold,
                     args = (
-                            self.scaler.fit_transform(Xtrain[:,:,t].T), 
-                            self.scaler.transform(Xtest[:,:,t].T), 
+                            Xtrain, Xtest, 
                             Ytrain, Ytest, 
                             models, scores, cms,
-                            optimize, 'full'
+                            optimize
                         )
                     )
                 )
+                
             # clear the fold data from memory
             del Xtrain;del Xtest
             del Ytrain;del Ytest
@@ -773,15 +608,40 @@ class _InvalidYDim(Exception):
         """
         super().__init__(self.message)
         
-class _NoDelayEmbeddingArgs(Exception):
+class _MissingEmbeddingArgs(Exception):
     """
-    Exception raised for when t = 'embedded' but no time_lag and/or
-    time_range arguemnts are given.
+    Exception raised for when feature or sample embedding 
+    is used but necessary arguemnts are missing.
     """
 
     def __init__(self, arg):
         self.message = f"""
-        t = 'embedded' argument passed but no {arg} embedding parameter was given.
+        t = User tried to use time embedding, but no {arg} parameter was given.
+        """
+        super().__init__(self.message)
+        
+        
+class _LagTooLong(Exception):
+    """
+    Exception raised for when the lag for time embedding
+    is longer than the time point being predicted.
+    """
+
+    def __init__(self, arg1, arg2):
+        self.message = f"""
+        t = Lag of length ({arg1}) is longer than the timepoint being predicted ({arg2}).
+        """
+        super().__init__(self.message)
+        
+class _InvalidSpaceArg(Exception):         
+    """
+    Exception raised for when the space arguemt for time 
+    embedding is invalid.
+    """
+
+    def __init__(self, arg):
+        self.message = f"""
+        t = '{arg}' is an invalid argument for the space parameter.
         """
         super().__init__(self.message)
         
